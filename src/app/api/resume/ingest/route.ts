@@ -4,8 +4,24 @@ import { FieldValue } from 'firebase-admin/firestore';
 import { extractTextFromFile } from '@/lib/extractTextFromFile';
 import { parseResume } from '@/lib/parseResume';
 
-export const runtime = 'nodejs';           // ensure Node runtime (file parsing)
-export const dynamic = 'force-dynamic';    // allow file uploads in dev/prod
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+function normalizeSkills(skills: string[] = []) {
+  // basic normalizer: trim, lower for dedup, keep original casing from first seen
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of skills) {
+    const s = String(raw).trim();
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(s);
+    }
+  }
+  return out;
+}
 
 export async function POST(req: Request) {
   try {
@@ -36,9 +52,9 @@ export async function POST(req: Request) {
       background_info: unknown;
       resume_summary: unknown;
     }> = {};
-    if (parsed.personal_info)   patch['personal_info'] = parsed.personal_info;
-    if (parsed.background_info) patch['background_info'] = parsed.background_info;
-    if (parsed.resume_summary)  patch['resume_summary'] = parsed.resume_summary;
+    if (parsed.personal_info)   patch.personal_info   = parsed.personal_info;
+    if (parsed.background_info) patch.background_info = parsed.background_info;
+    if (parsed.resume_summary)  patch.resume_summary  = parsed.resume_summary;
 
     // 4) Write to Firestore
     const ref = db.collection('jobseekers').doc(userId);
@@ -48,23 +64,30 @@ export async function POST(req: Request) {
       await ref.set(patch, { merge: true });
     }
 
-    // 4b) skills: choose add or replace behavior
-    if (parsed.skills?.length) {
-      if (mode === 'replace') {
-        await ref.set({ skills: parsed.skills }, { merge: true });
-      } else {
-        // add (unique) — we still do a read to avoid case-duplication
-        const snap = await ref.get();
-        const cur: string[] = (snap.data()?.skills || []).filter((s: unknown): s is string => typeof s === 'string');
-        const curSet = new Set(cur.map(s => s.toLowerCase()));
-        const toAdd = parsed.skills.filter(s => !curSet.has(s.toLowerCase()));
-        if (toAdd.length) {
-          await ref.update({ skills: FieldValue.arrayUnion(...toAdd) });
-        }
+    // ---- Skills handling ---------------------------------------------------
+    const parsedSkills = normalizeSkills(parsed.skills || []);
+
+    if (mode === 'replace') {
+      // ALWAYS overwrite, even if parser found nothing
+      await ref.set({ skills: parsedSkills }, { merge: true });
+    } else if (mode === 'add' && parsedSkills.length) {
+      // add (unique) — do a read to avoid case-duplication
+      const snap = await ref.get();
+      const cur: string[] =
+        (snap.data()?.skills || []).filter((s: unknown): s is string => typeof s === 'string');
+      const curSet = new Set(cur.map(s => s.toLowerCase()));
+      const toAdd = parsedSkills.filter(s => !curSet.has(s.toLowerCase()));
+      if (toAdd.length) {
+        await ref.update({ skills: FieldValue.arrayUnion(...toAdd) });
       }
     }
+    // -----------------------------------------------------------------------
+    return NextResponse.json({
+      ok: true,
+      parsed,
+      skillsApplied: { mode, resulting: mode === 'replace' ? parsedSkills : undefined }
+    });
 
-    return NextResponse.json({ ok:true, parsed });
   } catch (err) {
     console.error(err);
     return NextResponse.json({ ok:false, error: String((err as Error)?.message || err) }, { status:500 });
